@@ -3,6 +3,7 @@ const cors = require("cors");
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 const jwt = require("jsonwebtoken");
 require("dotenv").config();
+const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
 const port = process.env.PORT || 5000;
 
 const app = express();
@@ -10,14 +11,6 @@ const app = express();
 // middle ware
 app.use(cors());
 app.use(express.json());
-
-// declare mongoDB user and password for Database
-const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster0.l85wmee.mongodb.net/?retryWrites=true&w=majority`;
-const client = new MongoClient(uri, {
-  useNewUrlParser: true,
-  useUnifiedTopology: true,
-  serverApi: ServerApiVersion.v1,
-});
 
 // access token JWT (json web token)
 function verifyJWT(req, res, next) {
@@ -45,6 +38,15 @@ function verifyJWT(req, res, next) {
       4. app.patch("/bookings/:id")
       5. app.delete("/booking/:id")
        */
+
+// declare mongoDB user and password for Database
+const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster0.l85wmee.mongodb.net/?retryWrites=true&w=majority`;
+const client = new MongoClient(uri, {
+  useNewUrlParser: true,
+  useUnifiedTopology: true,
+  serverApi: ServerApiVersion.v1,
+});
+
 // mongoDB all operations start from here
 async function run() {
   try {
@@ -57,6 +59,18 @@ async function run() {
       .collection("bookings");
     const usersCollection = client.db("doctorsPortal").collection("users");
     const doctorsCollection = client.db("doctorsPortal").collection("doctors");
+
+    // verify admin api creation NOTE: (make sure you use verifyAdmin after verifyJWT)
+    // this is also a middle ware
+    const verifyAdmin = async (req, res, next) => {
+      const decodedEmail = req.decoded.email;
+      const query = { email: decodedEmail };
+      const user = await usersCollection.findOne(query);
+      if (user?.role !== "admin") {
+        return res.status(403).send({ message: "forbidden access" });
+      }
+      next();
+    };
 
     // use aggregate to query multiple collection and then merge data.
     app.get("/appointmentOptions", async (req, res) => {
@@ -82,6 +96,14 @@ async function run() {
         option.slots = remainingSlots;
       });
       res.send(options);
+    });
+
+    // for booking payment API
+    app.get("/bookings/:id", async (req, res) => {
+      const id = req.params.id;
+      const query = { _id: ObjectId(id) };
+      const booking = await bookingsCollection.findOne(query);
+      res.send(booking);
     });
 
     app.post("/bookings", async (req, res) => {
@@ -126,6 +148,7 @@ async function run() {
           {
             $project: {
               name: 1,
+              price: 1,
               slots: 1,
               booked: {
                 $map: {
@@ -139,6 +162,7 @@ async function run() {
           {
             $project: {
               name: 1,
+              price: 1,
               slots: {
                 $setDifference: ["$slots", "$booked"],
               },
@@ -147,6 +171,21 @@ async function run() {
         ])
         .toArray();
       res.send(options);
+    });
+
+    // use stripe for payment method
+    app.post("/create-payment-intent", async (req, res) => {
+      const booking = req.body;
+      const price = booking.price;
+      const amount = price * 100;
+      const paymentIntent = await stripe.paymentIntents.create({
+        amount: amount,
+        currency: "usd",
+        automatic_payment_methods: ["card"],
+      });
+      res.send({
+        clientSecret: paymentIntent.client_secret,
+      });
     });
 
     // implement jwt (json web token) API access token
@@ -196,16 +235,8 @@ async function run() {
       res.send(result);
     });
 
-    // make admin api
-    app.put("/users/admin/:id", verifyJWT, async (req, res) => {
-      // make a admin using admin account
-      const decodedEmail = req.decoded.email;
-      const query = { email: decodedEmail };
-      const user = await usersCollection.findOne(query);
-      if (user?.role !== "admin") {
-        return res.status(403).send({ message: "forbidden access" });
-      }
-      // end the code
+    // make admin api and very jwt, verifyAdmin token
+    app.put("/users/admin/:id", verifyJWT, verifyAdmin, async (req, res) => {
       const id = req.params.id;
       const filter = { _id: ObjectId(id) };
       const options = { upsert: true };
@@ -222,6 +253,32 @@ async function run() {
       res.send(result);
     });
 
+    // temporary to update price field on appointment options
+    /*   app.get("/add-price", async (req, res) => {
+      const filter = {};
+      const options = { upsert: true };
+      const updatedDoc = {
+        $set: {
+          price: 99,
+        },
+      };
+      const result = await appointmentOptionCollection.updateMany(
+        filter,
+        updatedDoc,
+        options
+      );
+      res.send(result);
+    }); */
+
+    // delete user using modal delete button (delete from Database)
+    app.delete("/users/:id", verifyJWT, verifyAdmin, async (req, res) => {
+      const id = req.params.id;
+      const filter = { _id: ObjectId(id) };
+      const result = await usersCollection.deleteOne(filter);
+      // this is a asynchronous function that's why we use res.send() otherwise we use return()
+      res.send(result);
+    });
+
     // appointment specialty api creation
     app.get("/appointmentSpecialty", async (req, res) => {
       const query = {};
@@ -233,21 +290,21 @@ async function run() {
     });
 
     // store doctor data and photo from manage doctor section
-    app.post("/doctors", verifyJWT, async (req, res) => {
+    app.post("/doctors", verifyJWT, verifyAdmin, async (req, res) => {
       const doctor = req.body;
       const result = await doctorsCollection.insertOne(doctor);
       res.send(result);
     });
 
     // get all data from doctors collection
-    app.get("/doctors", verifyJWT, async (req, res) => {
+    app.get("/doctors", verifyJWT, verifyAdmin, async (req, res) => {
       const query = {};
       const doctors = await doctorsCollection.find(query).toArray();
       res.send(doctors);
     });
 
     // delete doctor using modal delete button
-    app.delete("/doctors/:id", verifyJWT, async (req, res) => {
+    app.delete("/doctors/:id", verifyJWT, verifyAdmin, async (req, res) => {
       const id = req.params.id;
       const filter = { _id: ObjectId(id) };
       const result = await doctorsCollection.deleteOne(filter);
